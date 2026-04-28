@@ -1,0 +1,1107 @@
+#!/usr/bin/env bash
+#
+# cr_ceph - Standalone S3-compatible Ceph storage manager for CockroachDB
+#
+# Zero dependencies — no external scripts required. Copy anywhere and run.
+#
+# Purpose: Manage the full lifecycle of an S3GW (Ceph S3-compatible gateway)
+#          container for CockroachDB backups, CDC, and data export/import.
+#
+# Usage: cr_ceph <subcommand> [OPTIONS]
+#
+# Subcommands:
+#   setup          Create & start S3GW container, create user, create buckets
+#   status         Show running S3GW container info (port, buckets, endpoints)
+#   create-bucket  Create a new S3 bucket
+#   list-buckets   List all S3 buckets
+#   list-backups   Show databases backed up in an S3 bucket (SHOW BACKUPS)
+#   show-backup    Show details of the latest backup (SHOW BACKUP FROM LATEST)
+#   uri            Generate BACKUP/RESTORE/CDC URIs for CockroachDB
+#   backup         Backup a database to S3 (requires -d)
+#   restore        Restore a database from S3 (requires -d, --restore-as)
+#   demo           Run demo: create sample DB, backup to S3, restore from S3
+#   cleanup        Remove S3GW container and optionally images
+#
+# Global Options:
+#   --runtime RUNTIME      Container runtime: docker or podman (auto-detected)
+#   --container NAME       S3GW container name (default: s3gw-rgw)
+#   --s3-port PORT         Host S3 port (default: 7480)
+#   --access-key KEY       S3 access key (default: CRDBACCESS, or env S3_ACCESS_KEY)
+#   --secret-key KEY       S3 secret key (default: CRDBSECRET, or env S3_SECRET_KEY)
+#   -h, --host HOST        CockroachDB host (default: localhost)
+#   -p, --port PORT        CockroachDB SQL port (default: 26257)
+#   -U, --user USER        CockroachDB user (default: root)
+#   -d, --database DB      CockroachDB database
+#   -t, --tenant TENANT    Tenant / virtual cluster (default: system)
+#   --insecure             Insecure CockroachDB connection
+#   --certs-dir DIR        CockroachDB certs directory
+#   --help                 Show this help message
+#
+# Setup Options:
+#   --image IMAGE          S3GW image (default: quay.io/s3gw/s3gw:v0.23.1)
+#   --network NET          Docker network (default: roachnet1)
+#   --bucket NAME          Backup bucket name (default: crdb-backups)
+#   --cdc-bucket NAME      CDC bucket name (default: crdb-cdc)
+#   --quota SIZE           User quota (default: 1G)
+#   --osd-size SIZE        OSD size (default: 20G)
+#
+# URI Options:
+#   --bucket NAME          Bucket for URI (default: crdb-backups)
+#   --internal             Use internal container endpoint (container-to-container)
+#   --external             Use localhost endpoint (default, for host access)
+#
+# Backup Options:
+#   -d, --database DB      Database to backup (required)
+#   --bucket NAME          Target S3 bucket (default: crdb-backups)
+#
+# Restore Options:
+#   -d, --database DB      Database to restore (required)
+#   --restore-as NAME      Name for the restored database (required)
+#   --bucket NAME          Source S3 bucket (default: crdb-backups)
+#
+# Create-bucket Options:
+#   --name NAME            Bucket name (required)
+#
+# Cleanup Options:
+#   --remove-images        Also remove S3GW container images
+#
+# Examples:
+#   cr_ceph setup
+#   cr_ceph setup --bucket my-backups --cdc-bucket my-cdc --quota 5G
+#   cr_ceph status
+#   cr_ceph uri
+#   cr_ceph uri --bucket my-backups --internal
+#   cr_ceph backup -d movr --insecure
+#   cr_ceph backup -d movr -t va --insecure
+#   cr_ceph restore -d movr --restore-as movr_new --insecure
+#   cr_ceph list-backups --insecure
+#   cr_ceph list-backups --bucket crdb-test-backups -t system --insecure
+#   cr_ceph show-backup --insecure
+#   cr_ceph list-buckets
+#   cr_ceph create-bucket --name test-bucket
+#   cr_ceph demo --insecure
+#   cr_ceph cleanup
+#   cr_ceph cleanup --remove-images
+#
+
+set -euo pipefail
+
+# ══════════════════════════════════════════════════════════════════════
+# BUILT-IN HELPERS (no external dependencies)
+# ══════════════════════════════════════════════════════════════════════
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+NC='\033[0m'
+
+error()   { echo -e "${RED}ERROR: $*${NC}" >&2; exit 1; }
+info()    { echo -e "${CYAN}INFO: $*${NC}" >&2; }
+success() { echo -e "${GREEN}SUCCESS: $*${NC}" >&2; }
+warning() { echo -e "${YELLOW}WARNING: $*${NC}" >&2; }
+
+# ── Disk space validation ────────────────────────────────────────────
+
+_size_to_mb() {
+  local input="$1"
+  local num="${input//[!0-9.]/}"
+  local unit="${input//[0-9.]/}"
+  unit="$(echo "$unit" | tr '[:lower:]' '[:upper:]')"
+  [[ -z "$num" ]] && return 1
+  case "$unit" in
+    M|MB) awk "BEGIN {printf \"%d\", $num}" ;;
+    G|GB) awk "BEGIN {printf \"%d\", $num * 1024}" ;;
+    T|TB) awk "BEGIN {printf \"%d\", $num * 1024 * 1024}" ;;
+    *)    awk "BEGIN {printf \"%d\", $num * 1024}" ;;
+  esac
+}
+
+_check_disk_space() {
+  local requested="$1"
+  local requested_mb
+  requested_mb="$(_size_to_mb "$requested")" || return 0
+
+  local avail_mb
+  avail_mb="$(df -m / | awk 'NR==2 {print $4}')"
+  [[ -z "$avail_mb" || "$avail_mb" -eq 0 ]] 2>/dev/null && return 0
+
+  local avail_gb
+  avail_gb="$(awk "BEGIN {printf \"%.0f\", $avail_mb / 1024}")"
+
+  if [[ "$requested_mb" -gt "$avail_mb" ]]; then
+    error "Requested quota ${requested} exceeds available disk space (${avail_gb}G available)."
+  fi
+
+  local threshold_mb
+  threshold_mb="$(awk "BEGIN {printf \"%d\", $avail_mb * 0.8}")"
+  if [[ "$requested_mb" -gt "$threshold_mb" ]]; then
+    warning "Requested quota ${requested} uses more than 80% of available disk space (${avail_gb}G available)."
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# DEFAULTS
+# ══════════════════════════════════════════════════════════════════════
+
+# Global
+RUNTIME=""
+CONTAINER_NAME="s3gw-rgw"
+S3_PORT="7480"
+ACCESS_KEY="${S3_ACCESS_KEY:-CRDBACCESS}"
+SECRET_KEY="${S3_SECRET_KEY:-CRDBSECRET}"
+
+# Setup
+IMAGE="quay.io/s3gw/s3gw:v0.23.1"
+NETWORK="roachnet1"
+BUCKET="crdb-backups"
+CDC_BUCKET="crdb-cdc"
+QUOTA="1G"
+OSD_SIZE="20G"
+
+# CockroachDB connection
+HOST="localhost"
+PORT="26257"
+USER="root"
+DATABASE=""
+TENANT="system"
+INSECURE=""
+CERTS_DIR=""
+
+# URI
+URI_BUCKET=""
+URI_MODE="external"
+
+# Restore
+RESTORE_AS=""
+
+# Create-bucket
+NEW_BUCKET_NAME=""
+
+# Cleanup
+REMOVE_IMAGES=""
+
+# State file
+STATE_DIR="${HOME}/.cr_ceph"
+STATE_FILE="${STATE_DIR}/state.conf"
+
+# ══════════════════════════════════════════════════════════════════════
+# CORE HELPERS
+# ══════════════════════════════════════════════════════════════════════
+
+usage() {
+  sed -n '3,87p' "$0" | sed 's/^# //' | sed 's/^#//'
+  exit 0
+}
+
+state_set() {
+  local key="$1" val="$2"
+  mkdir -p "$STATE_DIR"
+  if [[ -f "$STATE_FILE" ]]; then
+    local tmp
+    tmp=$(grep -v "^${key}=" "$STATE_FILE" 2>/dev/null || true)
+    printf '%s\n' "$tmp" > "$STATE_FILE"
+  fi
+  echo "${key}=${val}" >> "$STATE_FILE"
+}
+
+state_get() {
+  local key="$1"
+  if [[ -f "$STATE_FILE" ]]; then
+    grep "^${key}=" "$STATE_FILE" 2>/dev/null | tail -1 | cut -d= -f2-
+  fi
+}
+
+detect_runtime() {
+  if [[ -n "$RUNTIME" ]]; then
+    if ! command -v "$RUNTIME" >/dev/null 2>&1; then
+      error "Container runtime '$RUNTIME' not found on PATH."
+    fi
+    return
+  fi
+  if command -v podman >/dev/null 2>&1; then
+    RUNTIME="podman"
+  elif command -v docker >/dev/null 2>&1; then
+    RUNTIME="docker"
+  else
+    error "No container runtime found. Install docker or podman."
+  fi
+}
+
+require_aws_cli() {
+  if ! command -v aws >/dev/null 2>&1; then
+    error "AWS CLI not found. Install via: pip install awscli"
+  fi
+}
+
+aws_s3() {
+  local endpoint="$1"; shift
+  env -i HOME="$HOME" PATH="$PATH" \
+    AWS_ACCESS_KEY_ID="$ACCESS_KEY" \
+    AWS_SECRET_ACCESS_KEY="$SECRET_KEY" \
+    AWS_DEFAULT_REGION="us-east-1" \
+    aws --endpoint-url "$endpoint" "$@"
+}
+
+# ── S3 endpoint helpers ──────────────────────────────────────────────
+
+s3_endpoint_internal() {
+  echo "http://${CONTAINER_NAME}:${S3_PORT}"
+}
+
+s3_endpoint_external() {
+  echo "http://localhost:${S3_PORT}"
+}
+
+# ── CockroachDB S3 URI builder ──────────────────────────────────────
+
+build_s3_uri() {
+  local bucket_name="$1"
+  local endpoint="$2"
+  echo "s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${endpoint}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+}
+
+# ── CockroachDB SQL execution ───────────────────────────────────────
+
+run_cockroach_sql() {
+  local sql="$1"
+  if [[ -n "$TENANT" && "$TENANT" != "system" ]]; then
+    local conn_url="postgresql://${USER}@${HOST}:${PORT}/${DATABASE}?options=-ccluster%3D${TENANT}"
+    if [[ -n "$INSECURE" || -z "$CERTS_DIR" ]]; then
+      conn_url+="&sslmode=disable"
+    else
+      conn_url+="&sslcert=${CERTS_DIR}/client.${USER}.crt&sslkey=${CERTS_DIR}/client.${USER}.key&sslrootcert=${CERTS_DIR}/ca.crt&sslmode=verify-full"
+    fi
+    cockroach sql --url="$conn_url" -e "$sql" 2>&1 || true
+  else
+    local conn_args=(--host="$HOST" --port="$PORT")
+    if [[ -n "$INSECURE" || -z "$CERTS_DIR" ]]; then
+      conn_args+=(--insecure)
+    else
+      conn_args+=(--certs-dir="$CERTS_DIR")
+    fi
+    cockroach sql "${conn_args[@]}" -e "$sql" 2>&1 || true
+  fi
+}
+
+# ── Load persisted S3 credentials ───────────────────────────────────
+
+load_s3_credentials() {
+  local stored_ak stored_sk
+  stored_ak="$(state_get CEPH_ACCESS_KEY)"
+  stored_sk="$(state_get CEPH_SECRET_KEY)"
+  [[ -n "$stored_ak" ]] && ACCESS_KEY="$stored_ak"
+  [[ -n "$stored_sk" ]] && SECRET_KEY="$stored_sk"
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: setup
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_setup() {
+  detect_runtime
+
+  # Validate disk space for requested quota
+  _check_disk_space "$QUOTA"
+
+  echo
+  echo -e "${CYAN}━━━ Setting up S3GW (S3-compatible Ceph gateway) ━━━${NC}"
+  echo
+  echo "  Image          : ${IMAGE}"
+  echo "  Container      : ${CONTAINER_NAME}"
+  echo "  S3 port        : ${S3_PORT}"
+  echo "  Network        : ${NETWORK}"
+  echo "  Backup bucket  : ${BUCKET}"
+  echo "  CDC bucket     : ${CDC_BUCKET}"
+  echo "  Access key     : ${ACCESS_KEY}"
+  echo "  Secret key     : ${SECRET_KEY}"
+  echo "  OSD size       : ${OSD_SIZE}"
+  echo "  Quota          : ${QUOTA}"
+  echo "  Runtime        : ${RUNTIME}"
+  echo
+
+  # Ensure network
+  $RUNTIME network inspect "$NETWORK" >/dev/null 2>&1 || \
+    $RUNTIME network create -d bridge "$NETWORK"
+
+  # Start or reuse container
+  info "Starting S3GW container '${CONTAINER_NAME}'..."
+
+  if $RUNTIME ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    warning "Container '${CONTAINER_NAME}' already exists; starting it."
+    $RUNTIME start "$CONTAINER_NAME" 2>/dev/null || true
+  else
+    info "Pulling image ${IMAGE}..."
+    $RUNTIME pull "$IMAGE"
+    $RUNTIME run -d \
+      --name "$CONTAINER_NAME" \
+      --net "$NETWORK" \
+      --network-alias "$CONTAINER_NAME" \
+      -p "${S3_PORT}:7480" \
+      -e OSD_SIZE="${OSD_SIZE}" \
+      -e RGW_DEFAULT_USER_ACCESS_KEY="${ACCESS_KEY}" \
+      -e RGW_DEFAULT_USER_SECRET_KEY="${SECRET_KEY}" \
+      "$IMAGE"
+  fi
+
+  # Wait for RGW readiness
+  info "Waiting for S3GW to become ready..."
+  local have_rgw_admin=0
+  if $RUNTIME exec "$CONTAINER_NAME" which radosgw-admin >/dev/null 2>&1; then
+    have_rgw_admin=1
+  fi
+
+  local retries=40 sleep_between=4 rgw_ready=0
+  for i in $(seq 1 "$retries"); do
+    if [[ "$have_rgw_admin" -eq 1 ]]; then
+      if $RUNTIME exec "$CONTAINER_NAME" radosgw-admin user list >/dev/null 2>&1; then
+        rgw_ready=1; break
+      fi
+    else
+      if curl -sS --max-time 10 -o /dev/null "http://localhost:${S3_PORT}" 2>/dev/null; then
+        rgw_ready=1; break
+      fi
+    fi
+    echo "  RGW not ready yet (attempt ${i}/${retries})..."
+    sleep "$sleep_between"
+  done
+
+  if [[ "$rgw_ready" -ne 1 ]]; then
+    error "S3GW did not become ready after ${retries} attempts."
+  fi
+  success "S3GW is responding."
+
+  # Detect version (best-effort)
+  local ceph_version_str="unknown"
+  if $RUNTIME exec "$CONTAINER_NAME" ceph --version >/dev/null 2>&1; then
+    ceph_version_str="$($RUNTIME exec "$CONTAINER_NAME" ceph --version | head -n1)"
+  elif $RUNTIME exec "$CONTAINER_NAME" radosgw --version >/dev/null 2>&1; then
+    ceph_version_str="$($RUNTIME exec "$CONTAINER_NAME" radosgw --version | head -n1)"
+  fi
+
+  # Create S3 user
+  local s3_user_id="crdb-test"
+  if [[ "$have_rgw_admin" -eq 1 ]]; then
+    info "Ensuring S3 user '${s3_user_id}' exists via radosgw-admin..."
+    set +e
+    $RUNTIME exec "$CONTAINER_NAME" radosgw-admin user create \
+      --uid="${s3_user_id}" \
+      --display-name="CRDB Test User" \
+      --access-key="${ACCESS_KEY}" \
+      --secret-key="${SECRET_KEY}" >/dev/null 2>&1
+    local rc=$?
+    set -e
+    if [[ "$rc" -ne 0 ]]; then
+      warning "user create returned ${rc}; assuming user already exists."
+    fi
+  else
+    warning "Container does not have radosgw-admin; skipping S3 user creation."
+    echo "  Ensure these credentials exist in the S3GW instance:"
+    echo "    Access key: ${ACCESS_KEY}"
+    echo "    Secret key: ${SECRET_KEY}"
+  fi
+
+  # Apply quota (best-effort)
+  if [[ "$have_rgw_admin" -eq 1 && -n "$QUOTA" ]]; then
+    info "Applying user quota (${QUOTA})..."
+    set +e
+    $RUNTIME exec "$CONTAINER_NAME" radosgw-admin quota set \
+      --uid="${s3_user_id}" --quota-scope=user --max-size="${QUOTA}" >/dev/null 2>&1
+    $RUNTIME exec "$CONTAINER_NAME" radosgw-admin quota enable \
+      --uid="${s3_user_id}" --quota-scope=user >/dev/null 2>&1
+    set -e
+  fi
+
+  # Create default buckets via AWS CLI if available
+  if command -v aws >/dev/null 2>&1; then
+    local host_ep
+    host_ep="$(s3_endpoint_external)"
+
+    info "Creating bucket: ${BUCKET}"
+    if aws_s3 "$host_ep" s3 mb "s3://${BUCKET}" 2>/dev/null; then
+      success "Bucket '${BUCKET}' created."
+    else
+      warning "Bucket '${BUCKET}' may already exist."
+    fi
+
+    info "Creating bucket: ${CDC_BUCKET}"
+    if aws_s3 "$host_ep" s3 mb "s3://${CDC_BUCKET}" 2>/dev/null; then
+      success "Bucket '${CDC_BUCKET}' created."
+    else
+      warning "Bucket '${CDC_BUCKET}' may already exist."
+    fi
+  else
+    warning "AWS CLI not found; skipping bucket creation."
+    echo "  Install via: pip install awscli"
+    echo "  Then create buckets manually:"
+    echo "    aws --endpoint-url http://localhost:${S3_PORT} s3 mb s3://${BUCKET}"
+    echo "    aws --endpoint-url http://localhost:${S3_PORT} s3 mb s3://${CDC_BUCKET}"
+  fi
+
+  # Persist state
+  state_set "CEPH_CONTAINER" "$CONTAINER_NAME"
+  state_set "CEPH_S3_PORT" "$S3_PORT"
+  state_set "CEPH_ENDPOINT" "$(s3_endpoint_internal)"
+  state_set "CEPH_HOST_ENDPOINT" "$(s3_endpoint_external)"
+  state_set "CEPH_ACCESS_KEY" "$ACCESS_KEY"
+  state_set "CEPH_SECRET_KEY" "$SECRET_KEY"
+  state_set "CEPH_BUCKET" "$BUCKET"
+  state_set "CEPH_CDC_BUCKET" "$CDC_BUCKET"
+  state_set "CEPH_QUOTA" "$QUOTA"
+  state_set "CEPH_IMAGE" "$IMAGE"
+  state_set "CEPH_VERSION" "$ceph_version_str"
+  state_set "CEPH_NETWORK" "$NETWORK"
+  state_set "CEPH_RUNTIME" "$RUNTIME"
+
+  # Summary
+  echo
+  echo -e "${GREEN}━━━ S3GW is ready ━━━${NC}"
+  echo "  Container          : ${CONTAINER_NAME}"
+  echo "  Detected version   : ${ceph_version_str}"
+  echo "  S3 endpoint (net)  : $(s3_endpoint_internal)"
+  echo "  S3 endpoint (host) : $(s3_endpoint_external)"
+  echo "  Access key         : ${ACCESS_KEY}"
+  echo "  Secret key         : ${SECRET_KEY}"
+  echo "  Backup bucket      : ${BUCKET}"
+  echo "  CDC bucket         : ${CDC_BUCKET}"
+  echo "  Quota              : ${QUOTA}"
+  echo
+  echo "Quick start:"
+  echo "  cr_ceph uri             # Show BACKUP/RESTORE URIs"
+  echo "  cr_ceph list-buckets    # List S3 buckets"
+  echo "  cr_ceph status          # Show container status"
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: status
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_status() {
+  detect_runtime
+
+  echo
+  echo -e "${CYAN}━━━ S3GW Status ━━━${NC}"
+  echo
+
+  if ! $RUNTIME ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    warning "No S3GW container named '${CONTAINER_NAME}' found."
+    echo
+    echo "Run 'cr_ceph setup' to create one."
+    return 1
+  fi
+
+  local status
+  status="$($RUNTIME inspect --format '{{.State.Status}}' "$CONTAINER_NAME" 2>/dev/null || echo "unknown")"
+
+  echo "  Container   : ${CONTAINER_NAME}"
+  echo "  Status      : ${status}"
+  echo "  Runtime     : ${RUNTIME}"
+
+  local s3_port endpoint host_endpoint access_key secret_key bucket cdc_bucket quota version
+  s3_port="$(state_get CEPH_S3_PORT)"
+  endpoint="$(state_get CEPH_ENDPOINT)"
+  host_endpoint="$(state_get CEPH_HOST_ENDPOINT)"
+  access_key="$(state_get CEPH_ACCESS_KEY)"
+  secret_key="$(state_get CEPH_SECRET_KEY)"
+  bucket="$(state_get CEPH_BUCKET)"
+  cdc_bucket="$(state_get CEPH_CDC_BUCKET)"
+  quota="$(state_get CEPH_QUOTA)"
+  version="$(state_get CEPH_VERSION)"
+
+  echo "  S3 port     : ${s3_port:-${S3_PORT}}"
+  echo "  Endpoint    : ${host_endpoint:-http://localhost:${S3_PORT}}"
+  echo "  Internal EP : ${endpoint:-http://${CONTAINER_NAME}:${S3_PORT}}"
+  echo "  Access key  : ${access_key:-${ACCESS_KEY}}"
+  echo "  Secret key  : ${secret_key:-${SECRET_KEY}}"
+  echo "  Bucket      : ${bucket:-${BUCKET}}"
+  echo "  CDC bucket  : ${cdc_bucket:-${CDC_BUCKET}}"
+  echo "  Quota       : ${quota:-${QUOTA}}"
+  echo "  Version     : ${version:-unknown}"
+  echo
+
+  if [[ "$status" == "running" ]]; then
+    local ep="${host_endpoint:-http://localhost:${S3_PORT}}"
+    if curl -sS --max-time 5 -o /dev/null "$ep" 2>/dev/null; then
+      success "S3GW endpoint is responding."
+    else
+      warning "S3GW container is running but endpoint is not responding."
+    fi
+  else
+    warning "S3GW container is not running. Start with: ${RUNTIME} start ${CONTAINER_NAME}"
+  fi
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: create-bucket
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_create_bucket() {
+  if [[ -z "$NEW_BUCKET_NAME" ]]; then
+    error "Bucket name is required. Use --name <bucket-name>"
+  fi
+
+  detect_runtime
+  require_aws_cli
+  load_s3_credentials
+
+  local host_ep
+  host_ep="$(state_get CEPH_HOST_ENDPOINT)"
+  host_ep="${host_ep:-http://localhost:${S3_PORT}}"
+
+  info "Creating bucket: ${NEW_BUCKET_NAME}"
+  if aws_s3 "$host_ep" s3 mb "s3://${NEW_BUCKET_NAME}"; then
+    success "Bucket '${NEW_BUCKET_NAME}' created."
+  else
+    error "Failed to create bucket '${NEW_BUCKET_NAME}'."
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: list-buckets
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_list_buckets() {
+  detect_runtime
+  require_aws_cli
+  load_s3_credentials
+
+  local host_ep
+  host_ep="$(state_get CEPH_HOST_ENDPOINT)"
+  host_ep="${host_ep:-http://localhost:${S3_PORT}}"
+
+  echo
+  echo -e "${CYAN}━━━ S3 Buckets ━━━${NC}"
+  echo
+  aws_s3 "$host_ep" s3 ls
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: list-backups
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_list_backups() {
+  if ! command -v cockroach >/dev/null 2>&1; then
+    error "cockroach CLI not found on PATH. Install CockroachDB first."
+  fi
+
+  load_s3_credentials
+
+  local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
+  bucket_name="${bucket_name:-${BUCKET}}"
+
+  local internal_ep
+  internal_ep="$(state_get CEPH_ENDPOINT)"
+  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+
+  local s3_uri
+  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+  echo
+  echo -e "${CYAN}━━━ Backups in S3 bucket '${bucket_name}' ━━━${NC}"
+  echo
+  echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
+  echo "  S3 bucket   : ${bucket_name}"
+  echo "  S3 endpoint : ${internal_ep}"
+  echo
+
+  info "Running SHOW BACKUPS..."
+  echo
+  run_cockroach_sql "SHOW BACKUPS IN '${s3_uri}';"
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: show-backup
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_show_backup() {
+  if ! command -v cockroach >/dev/null 2>&1; then
+    error "cockroach CLI not found on PATH. Install CockroachDB first."
+  fi
+
+  load_s3_credentials
+
+  local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
+  bucket_name="${bucket_name:-${BUCKET}}"
+
+  local internal_ep
+  internal_ep="$(state_get CEPH_ENDPOINT)"
+  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+
+  local s3_uri
+  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+  echo
+  echo -e "${CYAN}━━━ Latest backup in S3 bucket '${bucket_name}' ━━━${NC}"
+  echo
+  echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
+  echo "  S3 bucket   : ${bucket_name}"
+  echo "  S3 endpoint : ${internal_ep}"
+  echo
+
+  info "Running SHOW BACKUP FROM LATEST..."
+  echo
+  run_cockroach_sql "SHOW BACKUP FROM LATEST IN '${s3_uri}';"
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: uri
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_uri() {
+  load_s3_credentials
+
+  local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
+  bucket_name="${bucket_name:-${BUCKET}}"
+
+  local cdc_bucket_name
+  cdc_bucket_name="$(state_get CEPH_CDC_BUCKET)"
+  cdc_bucket_name="${cdc_bucket_name:-${CDC_BUCKET}}"
+
+  local endpoint
+  if [[ "$URI_MODE" == "internal" ]]; then
+    endpoint="$(state_get CEPH_ENDPOINT)"
+    endpoint="${endpoint:-$(s3_endpoint_internal)}"
+  else
+    endpoint="$(state_get CEPH_HOST_ENDPOINT)"
+    endpoint="${endpoint:-$(s3_endpoint_external)}"
+  fi
+
+  local backup_uri
+  backup_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${endpoint}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+  local cdc_uri
+  cdc_uri="s3://${cdc_bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${endpoint}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+  echo
+  echo -e "${CYAN}━━━ CockroachDB S3 URIs (${URI_MODE} endpoint) ━━━${NC}"
+  echo
+  echo "CockroachDB  : ${HOST}:${PORT} (tenant: ${TENANT})"
+  echo "Endpoint     : ${endpoint}"
+  echo
+  echo "BACKUP:"
+  echo "  BACKUP DATABASE <dbname> INTO '${backup_uri}';"
+  echo
+  echo "RESTORE:"
+  echo "  RESTORE DATABASE <dbname> FROM LATEST IN '${backup_uri}' WITH new_db_name = 'defaultdb_new';"
+  echo
+  echo "CHANGEFEED:"
+  echo "  CREATE CHANGEFEED FOR TABLE <table> INTO '${cdc_uri}' WITH updated, resolved='10s';"
+  echo
+  echo "AWS CLI (from host):"
+  local host_ep
+  host_ep="$(state_get CEPH_HOST_ENDPOINT)"
+  host_ep="${host_ep:-$(s3_endpoint_external)}"
+  echo "  export AWS_ACCESS_KEY_ID='${ACCESS_KEY}'"
+  echo "  export AWS_SECRET_ACCESS_KEY='${SECRET_KEY}'"
+  echo "  export AWS_DEFAULT_REGION='us-east-1'"
+  echo "  aws --endpoint-url '${host_ep}' s3 ls"
+  echo "  aws --endpoint-url '${host_ep}' s3 ls s3://${bucket_name}/"
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: backup
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_backup() {
+  if [[ -z "$DATABASE" ]]; then
+    error "Database name is required. Use -d <database>"
+  fi
+
+  if ! command -v cockroach >/dev/null 2>&1; then
+    error "cockroach CLI not found on PATH. Install CockroachDB first."
+  fi
+
+  load_s3_credentials
+
+  local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
+  bucket_name="${bucket_name:-${BUCKET}}"
+
+  local internal_ep
+  internal_ep="$(state_get CEPH_ENDPOINT)"
+  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+
+  local s3_uri
+  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+  echo
+  echo -e "${CYAN}━━━ Backup to S3 ━━━${NC}"
+  echo
+  echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
+  echo "  Database    : ${DATABASE}"
+  echo "  S3 bucket   : ${bucket_name}"
+  echo "  S3 endpoint : ${internal_ep}"
+  echo
+
+  local backup_sql="BACKUP DATABASE ${DATABASE} INTO '${s3_uri}';"
+
+  info "Backing up database '${DATABASE}' to S3..."
+  echo "  SQL: BACKUP DATABASE ${DATABASE} INTO 's3://${bucket_name}/...';"
+  echo
+  local output
+  output=$(run_cockroach_sql "$backup_sql")
+
+  if echo "$output" | grep -qi "succeeded\|job"; then
+    success "Backup of '${DATABASE}' completed."
+    echo "$output" | sed 's/^/  /'
+  else
+    echo "$output" | sed 's/^/  /'
+    error "Backup failed. See output above."
+  fi
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: restore
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_restore() {
+  if [[ -z "$DATABASE" ]]; then
+    error "Database name is required. Use -d <database>"
+  fi
+  if [[ -z "$RESTORE_AS" ]]; then
+    error "Restore target name is required. Use --restore-as <name>"
+  fi
+
+  if ! command -v cockroach >/dev/null 2>&1; then
+    error "cockroach CLI not found on PATH. Install CockroachDB first."
+  fi
+
+  load_s3_credentials
+
+  local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
+  bucket_name="${bucket_name:-${BUCKET}}"
+
+  local internal_ep
+  internal_ep="$(state_get CEPH_ENDPOINT)"
+  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+
+  local s3_uri
+  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+
+  echo
+  echo -e "${CYAN}━━━ Restore from S3 ━━━${NC}"
+  echo
+  echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
+  echo "  Source DB   : ${DATABASE}"
+  echo "  Restore as  : ${RESTORE_AS}"
+  echo "  S3 bucket   : ${bucket_name}"
+  echo "  S3 endpoint : ${internal_ep}"
+  echo
+
+  info "Dropping '${RESTORE_AS}' if it exists..."
+  run_cockroach_sql "DROP DATABASE IF EXISTS ${RESTORE_AS} CASCADE;" >/dev/null 2>&1
+
+  local restore_sql="RESTORE DATABASE ${DATABASE} FROM LATEST IN '${s3_uri}' WITH new_db_name = '${RESTORE_AS}';"
+
+  info "Restoring '${DATABASE}' as '${RESTORE_AS}' from S3..."
+  echo "  SQL: RESTORE DATABASE ${DATABASE} FROM LATEST IN 's3://${bucket_name}/...' WITH new_db_name = '${RESTORE_AS}';"
+  echo
+  local output
+  output=$(run_cockroach_sql "$restore_sql")
+
+  if echo "$output" | grep -qi "succeeded\|job"; then
+    success "Restore completed: '${DATABASE}' -> '${RESTORE_AS}'"
+    echo "$output" | sed 's/^/  /'
+  else
+    echo "$output" | sed 's/^/  /'
+    error "Restore failed. See output above."
+  fi
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: demo
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_demo() {
+  detect_runtime
+  require_aws_cli
+
+  if ! command -v cockroach >/dev/null 2>&1; then
+    error "cockroach CLI not found on PATH. Install CockroachDB first."
+  fi
+
+  load_s3_credentials
+
+  local host_ep
+  host_ep="$(state_get CEPH_HOST_ENDPOINT)"
+  host_ep="${host_ep:-$(s3_endpoint_external)}"
+
+  local internal_ep
+  internal_ep="$(state_get CEPH_ENDPOINT)"
+  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+
+  local bucket_name
+  bucket_name="$(state_get CEPH_BUCKET)"
+  bucket_name="${bucket_name:-${BUCKET}}"
+  local cdc_bucket_name
+  cdc_bucket_name="$(state_get CEPH_CDC_BUCKET)"
+  cdc_bucket_name="${cdc_bucket_name:-${CDC_BUCKET}}"
+
+  echo
+  echo -e "${CYAN}━━━ S3GW Demo: Backup, Restore & CDC ━━━${NC}"
+  echo
+  echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
+  echo "  S3 endpoint : ${host_ep}"
+  echo "  Bucket      : ${bucket_name}"
+  echo "  CDC bucket  : ${cdc_bucket_name}"
+  echo
+
+  info "Ensuring buckets exist..."
+  aws_s3 "$host_ep" s3 mb "s3://${bucket_name}" 2>/dev/null || true
+  aws_s3 "$host_ep" s3 mb "s3://${cdc_bucket_name}" 2>/dev/null || true
+  echo
+
+  local backup_uri
+  backup_uri="$(build_s3_uri "$bucket_name" "$internal_ep")"
+  local cdc_uri
+  cdc_uri="$(build_s3_uri "$cdc_bucket_name" "$internal_ep")"
+
+  info "Step 1: Creating database ceph_demo"
+  run_cockroach_sql "CREATE DATABASE IF NOT EXISTS ceph_demo;"
+  echo
+
+  info "Step 2: Creating table office_dogs"
+  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS office_dogs (id INT PRIMARY KEY, name STRING);"
+  echo
+
+  info "Step 3: Inserting initial data"
+  run_cockroach_sql "SET DATABASE = ceph_demo; INSERT INTO office_dogs VALUES (1, 'Petee'), (2, 'Carl') ON CONFLICT DO NOTHING;"
+  echo
+
+  info "Step 4: Updating a record"
+  run_cockroach_sql "SET DATABASE = ceph_demo; UPDATE office_dogs SET name = 'Petee H' WHERE id = 1;"
+  echo
+
+  info "Step 5: Creating employees table with foreign key"
+  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS employees (dog_id INT REFERENCES office_dogs (id), employee_name STRING);"
+  echo
+
+  info "Step 6: Creating changefeed to CDC bucket"
+  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE CHANGEFEED FOR TABLE office_dogs INTO '${cdc_uri}' WITH updated, resolved='10s';"
+  echo
+
+  info "Step 7: Inserting more data"
+  run_cockroach_sql "SET DATABASE = ceph_demo; INSERT INTO office_dogs VALUES (3, 'Buddy'), (4, 'Max') ON CONFLICT DO NOTHING;"
+  echo
+
+  info "Step 8: Backing up database to S3"
+  run_cockroach_sql "BACKUP DATABASE ceph_demo INTO '${backup_uri}';"
+  echo
+
+  info "Step 9: Restoring database from backup"
+  run_cockroach_sql "DROP DATABASE IF EXISTS restored_ceph_demo CASCADE;"
+  run_cockroach_sql "RESTORE DATABASE ceph_demo FROM LATEST IN '${backup_uri}' WITH new_db_name = 'restored_ceph_demo';"
+  echo
+
+  info "Step 10: Verifying restored data"
+  run_cockroach_sql "SELECT * FROM restored_ceph_demo.office_dogs ORDER BY id;"
+  echo
+
+  echo -e "${GREEN}━━━ Demo complete ━━━${NC}"
+  echo "  Backup bucket contents:"
+  aws_s3 "$host_ep" s3 ls "s3://${bucket_name}/" 2>/dev/null || echo "  (empty or not accessible)"
+  echo "  CDC bucket contents:"
+  aws_s3 "$host_ep" s3 ls "s3://${cdc_bucket_name}/" 2>/dev/null || echo "  (empty or not accessible)"
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# SUBCOMMAND: cleanup
+# ══════════════════════════════════════════════════════════════════════
+
+cmd_cleanup() {
+  detect_runtime
+
+  echo
+  echo -e "${CYAN}━━━ S3GW Cleanup ━━━${NC}"
+  echo
+
+  if $RUNTIME ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
+    info "Stopping container '${CONTAINER_NAME}'..."
+    $RUNTIME stop "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    info "Removing container '${CONTAINER_NAME}'..."
+    $RUNTIME rm -f "$CONTAINER_NAME" >/dev/null 2>&1 || true
+    success "Container '${CONTAINER_NAME}' removed."
+  else
+    warning "No container named '${CONTAINER_NAME}' found."
+  fi
+
+  if [[ -n "$REMOVE_IMAGES" ]]; then
+    info "Looking for S3GW-related images..."
+    local imgs
+    imgs="$($RUNTIME images --format '{{.Repository}}:{{.Tag}}' | grep -Ei 'ceph|s3gw' || true)"
+    if [[ -z "$imgs" ]]; then
+      echo "  No S3GW-related images found."
+    else
+      echo "  Removing images:"
+      while IFS= read -r img; do
+        [[ -z "$img" ]] && continue
+        echo "    ${img}"
+        $RUNTIME rmi -f "$img" >/dev/null 2>&1 || true
+      done <<< "$imgs"
+      success "Images removed."
+    fi
+  fi
+
+  # Clear state
+  if [[ -f "$STATE_FILE" ]]; then
+    local tmp
+    tmp=$(grep -v "^CEPH_" "$STATE_FILE" 2>/dev/null || true)
+    printf '%s\n' "$tmp" > "$STATE_FILE"
+  fi
+
+  success "S3GW cleanup complete."
+  echo
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# ARGUMENT PARSING
+# ══════════════════════════════════════════════════════════════════════
+
+SUBCOMMAND=""
+
+if [[ $# -gt 0 && ! "$1" =~ ^-- ]]; then
+  SUBCOMMAND="$1"
+  shift
+fi
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    # Global
+    --runtime)       RUNTIME="$2"; shift 2 ;;
+    --container)     CONTAINER_NAME="$2"; shift 2 ;;
+    --s3-port)       S3_PORT="$2"; shift 2 ;;
+    --access-key)    ACCESS_KEY="$2"; shift 2 ;;
+    --secret-key)    SECRET_KEY="$2"; shift 2 ;;
+    --help)          usage ;;
+
+    # Setup
+    --image)         IMAGE="$2"; shift 2 ;;
+    --network)       NETWORK="$2"; shift 2 ;;
+    --bucket)        BUCKET="$2"; URI_BUCKET="$2"; shift 2 ;;
+    --cdc-bucket)    CDC_BUCKET="$2"; shift 2 ;;
+    --quota)         QUOTA="$2"; shift 2 ;;
+    --osd-size)      OSD_SIZE="$2"; shift 2 ;;
+
+    # URI
+    --internal)      URI_MODE="internal"; shift ;;
+    --external)      URI_MODE="external"; shift ;;
+
+    # CockroachDB connection
+    -h|--host)       HOST="$2"; shift 2 ;;
+    -p|--port)       PORT="$2"; shift 2 ;;
+    -U|--user)       USER="$2"; shift 2 ;;
+    -d|--database)   DATABASE="$2"; shift 2 ;;
+    -t|--tenant)     TENANT="$2"; shift 2 ;;
+    --insecure)      INSECURE="1"; shift ;;
+    --certs-dir)     CERTS_DIR="$2"; shift 2 ;;
+
+    # Restore
+    --restore-as)    RESTORE_AS="$2"; shift 2 ;;
+
+    # Create-bucket
+    --name)          NEW_BUCKET_NAME="$2"; shift 2 ;;
+
+    # Cleanup
+    --remove-images) REMOVE_IMAGES="1"; shift ;;
+
+    *)
+      error "Unknown option: $1. Use --help for usage."
+      ;;
+  esac
+done
+
+# ── Dependency check ──────────────────────────────────────────────────
+# Validate all required tools upfront based on the subcommand so the user
+# gets a single clear error before anything starts.
+
+check_dependencies() {
+  local missing=()
+
+  # Container runtime — needed by all subcommands except uri
+  case "${SUBCOMMAND}" in
+    uri) ;;
+    *)
+      if [[ -n "$RUNTIME" ]]; then
+        command -v "$RUNTIME" >/dev/null 2>&1 || missing+=("$RUNTIME (container runtime)")
+      else
+        if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+          missing+=("podman or docker (container runtime)")
+        fi
+      fi
+      ;;
+  esac
+
+  # curl — needed for setup readiness check
+  case "${SUBCOMMAND}" in
+    setup) command -v curl >/dev/null 2>&1 || missing+=("curl (S3GW readiness check)") ;;
+  esac
+
+  # awk — needed for disk space validation and size conversion
+  case "${SUBCOMMAND}" in
+    setup) command -v awk >/dev/null 2>&1 || missing+=("awk (disk space validation)") ;;
+  esac
+
+  # AWS CLI — required for bucket operations, optional warning for setup
+  case "${SUBCOMMAND}" in
+    list-buckets|create-bucket)
+      command -v aws >/dev/null 2>&1 || missing+=("aws CLI (pip install awscli)")
+      ;;
+    demo)
+      command -v aws >/dev/null 2>&1 || missing+=("aws CLI (pip install awscli)")
+      ;;
+    setup)
+      if ! command -v aws >/dev/null 2>&1; then
+        warning "AWS CLI not found. Setup will proceed but bucket creation will be skipped."
+        echo "  Install via: pip install awscli"
+        echo
+      fi
+      ;;
+  esac
+
+  # cockroach CLI — needed for SQL operations
+  case "${SUBCOMMAND}" in
+    backup|restore|list-backups|show-backup|demo)
+      command -v cockroach >/dev/null 2>&1 || missing+=("cockroach CLI (CockroachDB SQL operations)")
+      ;;
+  esac
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    echo -e "${RED}ERROR: Missing required dependencies for 'cr_ceph ${SUBCOMMAND}':${NC}" >&2
+    for dep in "${missing[@]}"; do
+      echo -e "${RED}  - ${dep}${NC}" >&2
+    done
+    echo >&2
+    echo "Install the missing tools and try again." >&2
+    exit 1
+  fi
+}
+
+# Skip dependency check for help/usage
+if [[ -n "${SUBCOMMAND}" ]]; then
+  check_dependencies
+fi
+
+# ── Dispatch ──────────────────────────────────────────────────────────
+
+case "${SUBCOMMAND}" in
+  setup)         cmd_setup ;;
+  status)        cmd_status ;;
+  create-bucket) cmd_create_bucket ;;
+  list-buckets)  cmd_list_buckets ;;
+  list-backups)  cmd_list_backups ;;
+  show-backup)   cmd_show_backup ;;
+  uri)           cmd_uri ;;
+  backup)        cmd_backup ;;
+  restore)       cmd_restore ;;
+  demo)          cmd_demo ;;
+  cleanup)       cmd_cleanup ;;
+  "")            usage ;;
+  *)             error "Unknown subcommand: ${SUBCOMMAND}. Use --help for usage." ;;
+esac
