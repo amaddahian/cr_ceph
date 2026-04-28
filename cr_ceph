@@ -284,6 +284,20 @@ run_cockroach_sql() {
   fi
 }
 
+# ── CockroachDB connectivity check ─────────────────────────────────
+
+check_cockroach_connection() {
+  local conn_args=(--host="$HOST" --port="$PORT")
+  if [[ -n "$INSECURE" || -z "$CERTS_DIR" ]]; then
+    conn_args+=(--insecure)
+  else
+    conn_args+=(--certs-dir="$CERTS_DIR")
+  fi
+  if ! cockroach sql "${conn_args[@]}" -e "SELECT 1;" >/dev/null 2>&1; then
+    error "Cannot connect to CockroachDB at ${HOST}:${PORT}. Is the server running?"
+  fi
+}
+
 # ── Load persisted S3 credentials ───────────────────────────────────
 
 load_s3_credentials() {
@@ -587,6 +601,7 @@ cmd_list_backups() {
     error "cockroach CLI not found on PATH. Install CockroachDB first."
   fi
 
+  check_cockroach_connection
   load_s3_credentials
 
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
@@ -622,6 +637,7 @@ cmd_show_backup() {
     error "cockroach CLI not found on PATH. Install CockroachDB first."
   fi
 
+  check_cockroach_connection
   load_s3_credentials
 
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
@@ -716,6 +732,7 @@ cmd_backup() {
     error "cockroach CLI not found on PATH. Install CockroachDB first."
   fi
 
+  check_cockroach_connection
   load_s3_credentials
 
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
@@ -771,6 +788,7 @@ cmd_restore() {
     error "cockroach CLI not found on PATH. Install CockroachDB first."
   fi
 
+  check_cockroach_connection
   load_s3_credentials
 
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
@@ -826,6 +844,7 @@ cmd_demo() {
     error "cockroach CLI not found on PATH. Install CockroachDB first."
   fi
 
+  check_cockroach_connection
   load_s3_credentials
 
   local host_ep
