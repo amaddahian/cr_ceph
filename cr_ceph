@@ -282,6 +282,10 @@ s3_endpoint_for_cockroach() {
 
 run_cockroach_sql() {
   local sql="$1"
+  local echo_sql="${2:-}"   # pass "echo" to enable --echo-sql
+  local extra_flags=()
+  [[ "$echo_sql" == "echo" ]] && extra_flags+=(--echo-sql)
+
   if [[ -n "$TENANT" && "$TENANT" != "system" ]]; then
     local conn_url="postgresql://${USER}@${HOST}:${PORT}/${DATABASE}?options=-ccluster%3D${TENANT}"
     if [[ -n "$INSECURE" || -z "$CERTS_DIR" ]]; then
@@ -289,7 +293,7 @@ run_cockroach_sql() {
     else
       conn_url+="&sslcert=${CERTS_DIR}/client.${USER}.crt&sslkey=${CERTS_DIR}/client.${USER}.key&sslrootcert=${CERTS_DIR}/ca.crt&sslmode=verify-full"
     fi
-    cockroach sql --url="$conn_url" -e "$sql" 2>&1 || true
+    cockroach sql --url="$conn_url" "${extra_flags[@]}" -e "$sql" 2>&1 || true
   else
     local conn_args=(--host="$HOST" --port="$PORT")
     if [[ -n "$INSECURE" || -z "$CERTS_DIR" ]]; then
@@ -297,7 +301,7 @@ run_cockroach_sql() {
     else
       conn_args+=(--certs-dir="$CERTS_DIR")
     fi
-    cockroach sql "${conn_args[@]}" -e "$sql" 2>&1 || true
+    cockroach sql "${conn_args[@]}" "${extra_flags[@]}" -e "$sql" 2>&1 || true
   fi
 }
 
@@ -894,51 +898,55 @@ cmd_demo() {
   cdc_uri="$(build_s3_uri "$cdc_bucket_name" "$s3_ep")"
 
   info "Step 1: Creating database ceph_demo"
-  run_cockroach_sql "CREATE DATABASE IF NOT EXISTS ceph_demo;"
+  run_cockroach_sql "CREATE DATABASE IF NOT EXISTS ceph_demo;" echo
   echo
 
   info "Step 2: Creating table office_dogs"
-  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS office_dogs (id INT PRIMARY KEY, name STRING);"
+  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS office_dogs (id INT PRIMARY KEY, name STRING);" echo
   echo
 
   info "Step 3: Inserting initial data"
-  run_cockroach_sql "SET DATABASE = ceph_demo; INSERT INTO office_dogs VALUES (1, 'Petee'), (2, 'Carl') ON CONFLICT DO NOTHING;"
+  run_cockroach_sql "SET DATABASE = ceph_demo; INSERT INTO office_dogs VALUES (1, 'Petee'), (2, 'Carl') ON CONFLICT DO NOTHING;" echo
   echo
 
   info "Step 4: Updating a record"
-  run_cockroach_sql "SET DATABASE = ceph_demo; UPDATE office_dogs SET name = 'Petee H' WHERE id = 1;"
+  run_cockroach_sql "SET DATABASE = ceph_demo; UPDATE office_dogs SET name = 'Petee H' WHERE id = 1;" echo
   echo
 
   info "Step 5: Creating employees table with foreign key"
-  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS employees (dog_id INT REFERENCES office_dogs (id), employee_name STRING);"
+  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS employees (dog_id INT REFERENCES office_dogs (id), employee_name STRING);" echo
   echo
 
   info "Step 6: Enabling rangefeeds and creating changefeed to CDC bucket"
-  run_cockroach_sql "SET CLUSTER SETTING kv.rangefeed.enabled = true;"
-  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE CHANGEFEED FOR TABLE office_dogs INTO '${cdc_uri}' WITH updated, resolved='10s';"
+  run_cockroach_sql "SET CLUSTER SETTING kv.rangefeed.enabled = true;" echo
+  run_cockroach_sql "SET DATABASE = ceph_demo; CREATE CHANGEFEED FOR TABLE office_dogs INTO '${cdc_uri}' WITH updated, resolved='10s';" echo
   echo
 
   info "Step 7: Inserting more data"
-  run_cockroach_sql "SET DATABASE = ceph_demo; INSERT INTO office_dogs VALUES (3, 'Buddy'), (4, 'Max') ON CONFLICT DO NOTHING;"
+  run_cockroach_sql "SET DATABASE = ceph_demo; INSERT INTO office_dogs VALUES (3, 'Buddy'), (4, 'Max') ON CONFLICT DO NOTHING;" echo
   echo
 
   info "Step 8: Backing up database to S3"
-  run_cockroach_sql "BACKUP DATABASE ceph_demo INTO '${backup_uri}';"
+  run_cockroach_sql "BACKUP DATABASE ceph_demo INTO '${backup_uri}';" echo
   echo
 
   info "Step 9: Restoring database from backup"
-  run_cockroach_sql "DROP DATABASE IF EXISTS restored_ceph_demo CASCADE;"
-  run_cockroach_sql "RESTORE DATABASE ceph_demo FROM LATEST IN '${backup_uri}' WITH new_db_name = 'restored_ceph_demo';"
+  run_cockroach_sql "DROP DATABASE IF EXISTS restored_ceph_demo CASCADE;" echo
+  run_cockroach_sql "RESTORE DATABASE ceph_demo FROM LATEST IN '${backup_uri}' WITH new_db_name = 'restored_ceph_demo';" echo
   echo
 
   info "Step 10: Verifying restored data"
-  run_cockroach_sql "SELECT * FROM restored_ceph_demo.office_dogs ORDER BY id;"
+  run_cockroach_sql "SELECT * FROM restored_ceph_demo.office_dogs ORDER BY id;" echo
   echo
 
   echo -e "${GREEN}━━━ Demo complete ━━━${NC}"
+  echo
   echo "  Backup bucket contents:"
+  echo -e "  ${CYAN}\$ aws --endpoint-url '${host_ep}' s3 ls s3://${bucket_name}/${NC}"
   aws_s3 "$host_ep" s3 ls "s3://${bucket_name}/" 2>/dev/null || echo "  (empty or not accessible)"
+  echo
   echo "  CDC bucket contents:"
+  echo -e "  ${CYAN}\$ aws --endpoint-url '${host_ep}' s3 ls s3://${cdc_bucket_name}/${NC}"
   aws_s3 "$host_ep" s3 ls "s3://${cdc_bucket_name}/" 2>/dev/null || echo "  (empty or not accessible)"
   echo
 }
