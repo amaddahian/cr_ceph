@@ -187,10 +187,6 @@ cr_ceph cleanup --remove-images
 
 State is persisted to `~/.cr_ceph/state.conf` so credentials, endpoints, and bucket names survive across sessions.
 
-## Part of Roachie
-
-`cr_ceph` is extracted from the [Roachie](https://github.com/amaddahian/roachie) CockroachDB DBA toolkit. It works as a fully standalone tool — no other roachie components are needed.
-
 ## License
 
 Licensed under the [Apache License 2.0](LICENSE).
