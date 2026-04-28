@@ -16,6 +16,14 @@ Standalone S3-compatible Ceph storage manager for [CockroachDB](https://www.cock
 - **Persistent state** — remembers container config across sessions (`~/.cr_ceph/state.conf`)
 - **Disk space validation** — warns before exceeding 80% of available space
 
+## How It Works
+
+`cr_ceph` uses [S3GW](https://s3gw-docs.readthedocs.io/) — a lightweight, S3-compatible gateway built on Ceph — running as a container. This provides a local S3-compatible endpoint that CockroachDB can use natively for `BACKUP`, `RESTORE`, and `CREATE CHANGEFEED` operations without requiring cloud storage.
+
+![cr_ceph Architecture](diagram.png)
+
+State is persisted to `~/.cr_ceph/state.conf` so credentials, endpoints, and bucket names survive across sessions.
+
 ## Subcommands
 
 | Subcommand | Description |
@@ -178,14 +186,6 @@ cr_ceph cleanup --remove-images
 |----------|-------------|
 | `S3_ACCESS_KEY` | S3 access key (overrides default `CRDBACCESS`) |
 | `S3_SECRET_KEY` | S3 secret key (overrides default `CRDBSECRET`) |
-
-## How It Works
-
-`cr_ceph` uses [S3GW](https://s3gw-docs.readthedocs.io/) — a lightweight, S3-compatible gateway built on Ceph — running as a container. This provides a local S3-compatible endpoint that CockroachDB can use natively for `BACKUP`, `RESTORE`, and `CREATE CHANGEFEED` operations without requiring cloud storage.
-
-![cr_ceph Architecture](diagram.png)
-
-State is persisted to `~/.cr_ceph/state.conf` so credentials, endpoints, and bucket names survive across sessions.
 
 ## License
 
