@@ -67,22 +67,13 @@ A free trial license can be obtained from the [CockroachDB Licensing page](https
 ## Quick Start
 
 ```bash
-# 1. Setup S3GW container
+# 1. Clean up any previous S3GW state
+cr_ceph cleanup
+
+# 2. Setup S3GW container
 cr_ceph setup
 
-# 2. Check status
-cr_ceph status
-
-# 3. Show backup/restore URIs
-cr_ceph uri
-
-# 4. Backup a database
-cr_ceph backup -d movr --insecure
-
-# 5. Restore to a new database
-cr_ceph restore -d movr --restore-as movr_restored --insecure
-
-# 6. Run the full demo (creates sample DB, backs up, restores, verifies)
+# 3. Run the full demo (creates sample DB, backs up, restores, verifies)
 cr_ceph demo --insecure
 ```
 
