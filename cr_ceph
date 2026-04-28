@@ -261,6 +261,23 @@ build_s3_uri() {
   echo "s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${endpoint}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
 }
 
+# ── S3 endpoint for CockroachDB SQL ────────────────────────────────
+# When CockroachDB runs on the host (not in a container), it cannot
+# resolve the S3GW container hostname.  Use the external (localhost)
+# endpoint in that case.
+
+s3_endpoint_for_cockroach() {
+  if [[ "$HOST" == "localhost" || "$HOST" == "127.0.0.1" ]]; then
+    local ep
+    ep="$(state_get CEPH_HOST_ENDPOINT)"
+    echo "${ep:-$(s3_endpoint_external)}"
+  else
+    local ep
+    ep="$(state_get CEPH_ENDPOINT)"
+    echo "${ep:-$(s3_endpoint_internal)}"
+  fi
+}
+
 # ── CockroachDB SQL execution ───────────────────────────────────────
 
 run_cockroach_sql() {
@@ -607,19 +624,18 @@ cmd_list_backups() {
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
   bucket_name="${bucket_name:-${BUCKET}}"
 
-  local internal_ep
-  internal_ep="$(state_get CEPH_ENDPOINT)"
-  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+  local s3_ep
+  s3_ep="$(s3_endpoint_for_cockroach)"
 
   local s3_uri
-  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+  s3_uri="$(build_s3_uri "$bucket_name" "$s3_ep")"
 
   echo
   echo -e "${CYAN}━━━ Backups in S3 bucket '${bucket_name}' ━━━${NC}"
   echo
   echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
   echo "  S3 bucket   : ${bucket_name}"
-  echo "  S3 endpoint : ${internal_ep}"
+  echo "  S3 endpoint : ${s3_ep}"
   echo
 
   info "Running SHOW BACKUPS..."
@@ -643,19 +659,18 @@ cmd_show_backup() {
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
   bucket_name="${bucket_name:-${BUCKET}}"
 
-  local internal_ep
-  internal_ep="$(state_get CEPH_ENDPOINT)"
-  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+  local s3_ep
+  s3_ep="$(s3_endpoint_for_cockroach)"
 
   local s3_uri
-  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+  s3_uri="$(build_s3_uri "$bucket_name" "$s3_ep")"
 
   echo
   echo -e "${CYAN}━━━ Latest backup in S3 bucket '${bucket_name}' ━━━${NC}"
   echo
   echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
   echo "  S3 bucket   : ${bucket_name}"
-  echo "  S3 endpoint : ${internal_ep}"
+  echo "  S3 endpoint : ${s3_ep}"
   echo
 
   info "Running SHOW BACKUP FROM LATEST..."
@@ -738,12 +753,11 @@ cmd_backup() {
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
   bucket_name="${bucket_name:-${BUCKET}}"
 
-  local internal_ep
-  internal_ep="$(state_get CEPH_ENDPOINT)"
-  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+  local s3_ep
+  s3_ep="$(s3_endpoint_for_cockroach)"
 
   local s3_uri
-  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+  s3_uri="$(build_s3_uri "$bucket_name" "$s3_ep")"
 
   echo
   echo -e "${CYAN}━━━ Backup to S3 ━━━${NC}"
@@ -751,7 +765,7 @@ cmd_backup() {
   echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
   echo "  Database    : ${DATABASE}"
   echo "  S3 bucket   : ${bucket_name}"
-  echo "  S3 endpoint : ${internal_ep}"
+  echo "  S3 endpoint : ${s3_ep}"
   echo
 
   local backup_sql="BACKUP DATABASE ${DATABASE} INTO '${s3_uri}';"
@@ -794,12 +808,11 @@ cmd_restore() {
   local bucket_name="${URI_BUCKET:-$(state_get CEPH_BUCKET)}"
   bucket_name="${bucket_name:-${BUCKET}}"
 
-  local internal_ep
-  internal_ep="$(state_get CEPH_ENDPOINT)"
-  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+  local s3_ep
+  s3_ep="$(s3_endpoint_for_cockroach)"
 
   local s3_uri
-  s3_uri="s3://${bucket_name}?AWS_ACCESS_KEY_ID=${ACCESS_KEY}&AWS_SECRET_ACCESS_KEY=${SECRET_KEY}&AWS_ENDPOINT=${internal_ep}&AWS_REGION=us-east-1&AWS_USE_PATH_STYLE=true"
+  s3_uri="$(build_s3_uri "$bucket_name" "$s3_ep")"
 
   echo
   echo -e "${CYAN}━━━ Restore from S3 ━━━${NC}"
@@ -808,7 +821,7 @@ cmd_restore() {
   echo "  Source DB   : ${DATABASE}"
   echo "  Restore as  : ${RESTORE_AS}"
   echo "  S3 bucket   : ${bucket_name}"
-  echo "  S3 endpoint : ${internal_ep}"
+  echo "  S3 endpoint : ${s3_ep}"
   echo
 
   info "Dropping '${RESTORE_AS}' if it exists..."
@@ -851,9 +864,8 @@ cmd_demo() {
   host_ep="$(state_get CEPH_HOST_ENDPOINT)"
   host_ep="${host_ep:-$(s3_endpoint_external)}"
 
-  local internal_ep
-  internal_ep="$(state_get CEPH_ENDPOINT)"
-  internal_ep="${internal_ep:-$(s3_endpoint_internal)}"
+  local s3_ep
+  s3_ep="$(s3_endpoint_for_cockroach)"
 
   local bucket_name
   bucket_name="$(state_get CEPH_BUCKET)"
@@ -866,7 +878,7 @@ cmd_demo() {
   echo -e "${CYAN}━━━ S3GW Demo: Backup, Restore & CDC ━━━${NC}"
   echo
   echo "  CockroachDB : ${HOST}:${PORT} (tenant: ${TENANT})"
-  echo "  S3 endpoint : ${host_ep}"
+  echo "  S3 endpoint : ${s3_ep}"
   echo "  Bucket      : ${bucket_name}"
   echo "  CDC bucket  : ${cdc_bucket_name}"
   echo
@@ -877,9 +889,9 @@ cmd_demo() {
   echo
 
   local backup_uri
-  backup_uri="$(build_s3_uri "$bucket_name" "$internal_ep")"
+  backup_uri="$(build_s3_uri "$bucket_name" "$s3_ep")"
   local cdc_uri
-  cdc_uri="$(build_s3_uri "$cdc_bucket_name" "$internal_ep")"
+  cdc_uri="$(build_s3_uri "$cdc_bucket_name" "$s3_ep")"
 
   info "Step 1: Creating database ceph_demo"
   run_cockroach_sql "CREATE DATABASE IF NOT EXISTS ceph_demo;"
@@ -901,7 +913,8 @@ cmd_demo() {
   run_cockroach_sql "SET DATABASE = ceph_demo; CREATE TABLE IF NOT EXISTS employees (dog_id INT REFERENCES office_dogs (id), employee_name STRING);"
   echo
 
-  info "Step 6: Creating changefeed to CDC bucket"
+  info "Step 6: Enabling rangefeeds and creating changefeed to CDC bucket"
+  run_cockroach_sql "SET CLUSTER SETTING kv.rangefeed.enabled = true;"
   run_cockroach_sql "SET DATABASE = ceph_demo; CREATE CHANGEFEED FOR TABLE office_dogs INTO '${cdc_uri}' WITH updated, resolved='10s';"
   echo
 
