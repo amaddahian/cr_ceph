@@ -183,17 +183,7 @@ cr_ceph cleanup --remove-images
 
 `cr_ceph` uses [S3GW](https://s3gw-docs.readthedocs.io/) — a lightweight, S3-compatible gateway built on Ceph — running as a container. This provides a local S3-compatible endpoint that CockroachDB can use natively for `BACKUP`, `RESTORE`, and `CREATE CHANGEFEED` operations without requiring cloud storage.
 
-```
-┌──────────────┐     SQL: BACKUP INTO 's3://...'     ┌──────────────┐
-│              │ ──────────────────────────────────── │              │
-│ CockroachDB  │                                     │   S3GW       │
-│ Cluster      │ ──────────────────────────────────── │ (Ceph S3)    │
-│              │     SQL: RESTORE FROM 's3://...'     │  :7480       │
-└──────────────┘                                     └──────────────┘
-       │                                                    │
-       │  SQL: CREATE CHANGEFEED INTO 's3://...'            │
-       └────────────────────────────────────────────────────┘
-```
+![cr_ceph Architecture](diagram.png)
 
 State is persisted to `~/.cr_ceph/state.conf` so credentials, endpoints, and bucket names survive across sessions.
 
