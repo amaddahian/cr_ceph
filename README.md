@@ -67,14 +67,19 @@ A free trial license can be obtained from the [CockroachDB Licensing page](https
 ## Quick Start
 
 ```bash
+# Clone the repository
+git clone https://github.com/amaddahian/cr_ceph.git
+cd cr_ceph
+chmod +x cr_ceph
+
 # 1. Clean up any previous S3GW state
-cr_ceph cleanup
+./cr_ceph cleanup
 
 # 2. Setup S3GW container
-cr_ceph setup
+./cr_ceph setup
 
 # 3. Run the full demo (creates sample DB, backs up, restores, verifies)
-cr_ceph demo --insecure
+./cr_ceph demo --insecure
 ```
 
 ## Usage
