@@ -175,6 +175,7 @@ cr_ceph cleanup --remove-images
 | `--s3-port PORT` | Host S3 port | `7480` |
 | `--access-key KEY` | S3 access key | `CRDBACCESS` (or `$S3_ACCESS_KEY`) |
 | `--secret-key KEY` | S3 secret key | `CRDBSECRET` (or `$S3_SECRET_KEY`) |
+| `-o, --data-dir PATH` | Filesystem path to check for available space | `/` |
 | `-h, --host HOST` | CockroachDB host | `localhost` |
 | `-p, --port PORT` | CockroachDB SQL port | `26257` |
 | `-U, --user USER` | CockroachDB user | `root` |
