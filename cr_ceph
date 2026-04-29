@@ -44,6 +44,7 @@
 #   --cdc-bucket NAME      CDC bucket name (default: crdb-cdc)
 #   --quota SIZE           User quota (default: 1G)
 #   --osd-size SIZE        OSD size (default: 20G)
+#   -o, --data-dir PATH    Filesystem path to check for available space (default: /)
 #
 # URI Options:
 #   --bucket NAME          Bucket for URI (default: crdb-backups)
@@ -68,6 +69,7 @@
 # Examples:
 #   cr_ceph setup
 #   cr_ceph setup --bucket my-backups --cdc-bucket my-cdc --quota 5G
+#   cr_ceph setup --osd-size 50G --quota 5G -o /mnt/filesystem-1
 #   cr_ceph status
 #   cr_ceph uri
 #   cr_ceph uri --bucket my-backups --internal
@@ -119,24 +121,41 @@ _size_to_mb() {
 
 _check_disk_space() {
   local requested="$1"
+  local label="${2:-allocation}"
+  local check_path="${3:-/}"
   local requested_mb
   requested_mb="$(_size_to_mb "$requested")" || return 0
 
   local avail_mb
-  avail_mb="$(df -m / | awk 'NR==2 {print $4}')"
+  avail_mb="$(df -m "$check_path" | awk 'NR==2 {print $4}')"
   [[ -z "$avail_mb" || "$avail_mb" -eq 0 ]] 2>/dev/null && return 0
 
   local avail_gb
   avail_gb="$(awk "BEGIN {printf \"%.0f\", $avail_mb / 1024}")"
 
+  local fs_info=""
+  [[ "$check_path" != "/" ]] && fs_info=" on ${check_path}"
+
   if [[ "$requested_mb" -gt "$avail_mb" ]]; then
-    error "Requested quota ${requested} exceeds available disk space (${avail_gb}G available)."
+    error "Requested ${label} ${requested} exceeds available disk space${fs_info} (${avail_gb}G available)."
   fi
 
   local threshold_mb
   threshold_mb="$(awk "BEGIN {printf \"%d\", $avail_mb * 0.8}")"
   if [[ "$requested_mb" -gt "$threshold_mb" ]]; then
-    warning "Requested quota ${requested} uses more than 80% of available disk space (${avail_gb}G available)."
+    warning "Requested ${label} ${requested} uses more than 80% of available disk space${fs_info} (${avail_gb}G available)."
+  fi
+}
+
+_check_quota_vs_osd() {
+  local quota="$1"
+  local osd_size="$2"
+  local quota_mb osd_mb
+  quota_mb="$(_size_to_mb "$quota")" || return 0
+  osd_mb="$(_size_to_mb "$osd_size")" || return 0
+
+  if [[ "$quota_mb" -gt "$osd_mb" ]]; then
+    error "User quota ${quota} exceeds OSD size ${osd_size}. Quota must fit within the OSD."
   fi
 }
 
@@ -158,6 +177,7 @@ BUCKET="crdb-backups"
 CDC_BUCKET="crdb-cdc"
 QUOTA="1G"
 OSD_SIZE="20G"
+DATA_DIR="/"
 
 # CockroachDB connection
 HOST="localhost"
@@ -344,8 +364,10 @@ load_s3_credentials() {
 cmd_setup() {
   detect_runtime
 
-  # Validate disk space for requested quota
-  _check_disk_space "$QUOTA"
+  # Validate disk space for OSD and quota
+  _check_disk_space "$OSD_SIZE" "OSD size" "$DATA_DIR"
+  _check_disk_space "$QUOTA" "quota" "$DATA_DIR"
+  _check_quota_vs_osd "$QUOTA" "$OSD_SIZE"
 
   echo
   echo -e "${CYAN}━━━ Setting up S3GW (S3-compatible Ceph gateway) ━━━${NC}"
@@ -360,6 +382,7 @@ cmd_setup() {
   echo "  Secret key     : ${SECRET_KEY}"
   echo "  OSD size       : ${OSD_SIZE}"
   echo "  Quota          : ${QUOTA}"
+  echo "  Data dir       : ${DATA_DIR}"
   echo "  Runtime        : ${RUNTIME}"
   echo
 
@@ -1036,6 +1059,7 @@ while [[ $# -gt 0 ]]; do
     --cdc-bucket)    CDC_BUCKET="$2"; shift 2 ;;
     --quota)         QUOTA="$2"; shift 2 ;;
     --osd-size)      OSD_SIZE="$2"; shift 2 ;;
+    -o|--data-dir)   DATA_DIR="$2"; shift 2 ;;
 
     # URI
     --internal)      URI_MODE="internal"; shift ;;
