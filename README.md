@@ -86,7 +86,10 @@ chmod +x cr_ceph
 # 2. Setup S3GW container
 ./cr_ceph setup
 
-# 3. Run the full demo (creates sample DB, backs up, restores, verifies)
+# 3. Start CockroachDB (if not already running)
+cockroach start-single-node --insecure --background
+
+# 4. Run the full demo (creates sample DB, backs up, restores, verifies)
 ./cr_ceph demo --insecure
 ```
 
