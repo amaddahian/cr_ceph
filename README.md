@@ -101,6 +101,9 @@ cr_ceph setup
 # Custom setup
 cr_ceph setup --bucket my-backups --cdc-bucket my-cdc --quota 5G --osd-size 50G
 
+# Validate disk space against a specific mount point
+cr_ceph setup --osd-size 50G --quota 5G -o /mnt/filesystem-1
+
 # Use a specific container runtime
 cr_ceph setup --runtime docker
 
