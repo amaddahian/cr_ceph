@@ -262,20 +262,27 @@ build_s3_uri() {
 }
 
 # ── S3 endpoint for CockroachDB SQL ────────────────────────────────
-# When CockroachDB runs on the host (not in a container), it cannot
-# resolve the S3GW container hostname.  Use the external (localhost)
-# endpoint in that case.
+# BACKUP/RESTORE/CDC run server-side inside CockroachDB.  If CRDB runs
+# in a container on the same network as S3GW, it must use the internal
+# (container) endpoint.  Only use localhost when CRDB is truly on the host.
 
 s3_endpoint_for_cockroach() {
-  if [[ "$HOST" == "localhost" || "$HOST" == "127.0.0.1" ]]; then
-    local ep
-    ep="$(state_get CEPH_HOST_ENDPOINT)"
-    echo "${ep:-$(s3_endpoint_external)}"
-  else
-    local ep
-    ep="$(state_get CEPH_ENDPOINT)"
-    echo "${ep:-$(s3_endpoint_internal)}"
+  # If CRDB containers are on the S3GW network, use internal endpoint
+  local net
+  net="$(state_get CEPH_NETWORK)"
+  net="${net:-$NETWORK}"
+  if command -v "${RUNTIME:-podman}" >/dev/null 2>&1; then
+    if ${RUNTIME:-podman} ps --filter "network=$net" --format '{{.Names}}' 2>/dev/null | grep -qi 'roach'; then
+      local ep
+      ep="$(state_get CEPH_ENDPOINT)"
+      echo "${ep:-$(s3_endpoint_internal)}"
+      return
+    fi
   fi
+  # Fallback: CockroachDB on the host
+  local ep
+  ep="$(state_get CEPH_HOST_ENDPOINT)"
+  echo "${ep:-$(s3_endpoint_external)}"
 }
 
 # ── CockroachDB SQL execution ───────────────────────────────────────
@@ -327,6 +334,7 @@ load_s3_credentials() {
   stored_sk="$(state_get CEPH_SECRET_KEY)"
   [[ -n "$stored_ak" ]] && ACCESS_KEY="$stored_ak"
   [[ -n "$stored_sk" ]] && SECRET_KEY="$stored_sk"
+  return 0
 }
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1126,6 +1134,21 @@ check_dependencies() {
 # Skip dependency check for help/usage
 if [[ -n "${SUBCOMMAND}" ]]; then
   check_dependencies
+fi
+
+# ── Auto-detect TLS certs ─────────────────────────────────────────────
+# If --certs-dir was provided, use it.  Otherwise check the well-known
+# roachman cert directories (~/.roachie/certs/CA and CB).
+# CA is the default; CB is selected when the SQL port is in the 27xxx range.
+if [[ -z "$INSECURE" && -z "$CERTS_DIR" ]]; then
+  _cert_role="CA"
+  [[ "$PORT" =~ ^27[0-9]{3}$ ]] && _cert_role="CB"
+  _auto_certs="${HOME}/.roachie/certs/${_cert_role}"
+  if [[ -f "${_auto_certs}/ca.crt" && -f "${_auto_certs}/client.root.crt" ]]; then
+    CERTS_DIR="$_auto_certs"
+    info "Auto-detected TLS certs (${_cert_role}): ${CERTS_DIR}"
+  fi
+  unset _cert_role _auto_certs
 fi
 
 # ── Dispatch ──────────────────────────────────────────────────────────
